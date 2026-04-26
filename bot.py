@@ -1,55 +1,55 @@
 import asyncio
 import aiohttp
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ═══════════════════════════════════════════════════════════
 # Volume + Liquidation Signal Bot
-# Таймфрейм: 1 година | Платформа: Railway.app
+# Таймфрейм: 1 година | Біржа: Bybit Futures
 # ═══════════════════════════════════════════════════════════
 
 # ─── НАЛАШТУВАННЯ ───────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # токен від @BotFather
-CHAT_ID        = os.getenv("CHAT_ID")          # ваш chat_id від @userinfobot
-COINGLASS_KEY  = os.getenv("COINGLASS_KEY")    # ключ з coinglass.com/api
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID        = os.getenv("CHAT_ID")
+COINGLASS_KEY  = os.getenv("COINGLASS_KEY")
 
-# Монети для моніторингу
 SYMBOLS = ["BTC", "ETH", "SOL", "BNB"]
 
-# Налаштування пікового об'єму
-VOLUME_MULTIPLIER = 2.5   # пік = поточний об'єм > середнього в 2.5 рази
-LOOKBACK_CANDLES  = 20    # скільки свічок для розрахунку середнього
-
-# Налаштування ліквідацій
-LIQ_THRESHOLD_USD   = 5_000_000  # мін. кластер ліквідацій ($5M)
-PRICE_PROXIMITY_PCT = 0.5        # скільки % від ціни вважається "поруч"
-
-# Інтервал перевірки — 5 хвилин (таймфрейм 1H)
-CHECK_INTERVAL = 300
+VOLUME_MULTIPLIER   = 2.5
+LOOKBACK_CANDLES    = 20
+LIQ_THRESHOLD_USD   = 5_000_000
+PRICE_PROXIMITY_PCT = 0.5
+CHECK_INTERVAL      = 300
 
 # ─── URL ────────────────────────────────────────────────────
-BYBIT_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_URL     = "https://api.bybit.com/v5/market/kline"
 COINGLASS_URL = "https://open-api.coinglass.com/public/v2/liquidation_history"
-TELEGRAM_URL  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# ─── ОТРИМАННЯ СВІЧОК З BINANCE (1H) ────────────────────────
+# ─── ОТРИМАННЯ СВІЧОК З BYBIT ───────────────────────────────
 async def get_candles(session, symbol):
     params = {
         "category": "linear",
         "symbol":   f"{symbol}USDT",
-        "interval": "60",        # 60 хвилин = 1H на Bybit
+        "interval": "60",
         "limit":    str(LOOKBACK_CANDLES + 1)
     }
     try:
         async with session.get(BYBIT_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json()
+            text = await r.text()
+            data = json.loads(text)
+
+            if data.get("retCode") != 0:
+                print(f"[BYBIT ERROR] {symbol}: {data.get('retMsg')}")
+                return []
+
             candles = data.get("result", {}).get("list", [])
-            # Bybit повертає від новіших до старіших — перевертаємо
             candles = list(reversed(candles))
             return [{
                 "close":  float(c[4]),
                 "volume": float(c[5])
             } for c in candles]
+
     except Exception as e:
         print(f"[BYBIT ERROR] {symbol}: {e}")
         return []
@@ -70,37 +70,26 @@ async def get_liquidations(session, symbol):
 def detect_volume_peak(candles):
     if len(candles) < 2:
         return False, 0, 0
-
-    # Поточна свічка (остання, може бути незакрита)
     current = candles[-1]
-
-    # Попередні свічки для розрахунку середнього
     history = candles[:-1]
-
     avg_vol = sum(c["volume"] for c in history) / len(history)
     is_peak = current["volume"] >= avg_vol * VOLUME_MULTIPLIER
-
     return is_peak, current["volume"], avg_vol
 
-# ─── ПОШУК КЛАСТЕРІВ ЛІКВІДАЦІЙ ПОРУЧ З ЦІНОЮ ───────────────
+# ─── ПОШУК КЛАСТЕРІВ ЛІКВІДАЦІЙ ─────────────────────────────
 def find_nearby_liquidations(liq_data, current_price):
     threshold = current_price * (PRICE_PROXIMITY_PCT / 100)
     clusters  = []
-
     for item in liq_data:
         try:
             price_level = float(item.get("price", 0))
             liq_usd     = float(item.get("liquidationUsd", 0))
         except (TypeError, ValueError):
             continue
-
         if liq_usd < LIQ_THRESHOLD_USD:
             continue
-
         distance = abs(price_level - current_price)
         if distance <= threshold:
-            # Лонги ліквідуються коли ціна падає (рівень нижче поточної)
-            # Шорти ліквідуються коли ціна росте (рівень вище поточної)
             side = "LONG" if price_level < current_price else "SHORT"
             clusters.append({
                 "price":    price_level,
@@ -108,25 +97,20 @@ def find_nearby_liquidations(liq_data, current_price):
                 "side":     side,
                 "distance": distance
             })
-
-    # Сортуємо за розміром — найбільший кластер перший
     return sorted(clusters, key=lambda x: x["usd"], reverse=True)
 
 # ─── ФОРМУВАННЯ ПОВІДОМЛЕННЯ ─────────────────────────────────
 def build_message(symbol, price, volume, avg_vol, cluster):
-    ratio  = volume / avg_vol if avg_vol > 0 else 0
-    side   = cluster["side"]
-    liq_m  = cluster["usd"] / 1_000_000
+    ratio    = volume / avg_vol if avg_vol > 0 else 0
+    side     = cluster["side"]
+    liq_m    = cluster["usd"] / 1_000_000
     dist_pct = (cluster["distance"] / price) * 100
 
-    if side == "LONG":
-        signal  = "🟢 BUY"
-        reason  = "Великий кластер ліквідацій лонгів знизу\nЦіна може відскочити вгору"
-    else:
-        signal  = "🔴 SELL"
-        reason  = "Великий кластер ліквідацій шортів зверху\nЦіна може відскочити вниз"
+    signal = "🟢 BUY"  if side == "LONG"  else "🔴 SELL"
+    reason = "Кластер ліквідацій лонгів знизу — відскок вгору" \
+             if side == "LONG" else \
+             "Кластер ліквідацій шортів зверху — відскок вниз"
 
-    # Форматування об'єму
     if volume >= 1_000_000_000:
         vol_str = f"{volume/1_000_000_000:.2f}B"
     elif volume >= 1_000_000:
@@ -136,37 +120,33 @@ def build_message(symbol, price, volume, avg_vol, cluster):
     else:
         vol_str = f"{volume:.0f}"
 
-    now = datetime.utcnow().strftime("%H:%M UTC")
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
     return (
-        f"{signal} <b>{symbol}USDT</b> · 1H\n"
+        f"{signal} <b>{symbol}USDT</b> · 1H · Bybit\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"💰 Ціна:       <b>${price:,.2f}</b>\n"
         f"📊 Об'єм:      {vol_str} ({ratio:.1f}× середнього)\n"
-        f"💥 Ліквідації: ${liq_m:.1f}M на рівні ${cluster['price']:,.2f}\n"
+        f"💥 Ліквідації: ${liq_m:.1f}M на ${cluster['price']:,.2f}\n"
         f"📏 Відстань:   {dist_pct:.2f}% від ціни\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📌 {reason}\n"
         f"🕐 {now}"
     )
 
-# ─── НАДСИЛАННЯ ПОВІДОМЛЕННЯ В TELEGRAM ─────────────────────
+# ─── НАДСИЛАННЯ В TELEGRAM ───────────────────────────────────
 async def send_telegram(session, message):
-    payload = {
-        "chat_id":    CHAT_ID,
-        "text":       message,
-        "parse_mode": "HTML"
-    }
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        async with session.post(TELEGRAM_URL, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
             result = await r.json()
             if not result.get("ok"):
                 print(f"[TELEGRAM ERROR] {result}")
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
 
-# ─── ЗАХИСТ ВІД ДУБЛЮВАННЯ СИГНАЛІВ ─────────────────────────
-# Зберігаємо останній сигнал для кожної монети
+# ─── ЗАХИСТ ВІД ДУБЛЮВАННЯ ───────────────────────────────────
 last_signals = {}
 
 def is_duplicate(symbol, price, side):
@@ -178,72 +158,68 @@ def is_duplicate(symbol, price, side):
 
 # ─── ПЕРЕВІРКА ОДНІЄЇ МОНЕТИ ─────────────────────────────────
 async def check_symbol(session, symbol):
-    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Перевірка {symbol}...")
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    print(f"[{now}] Перевірка {symbol}...")
 
-    # 1. Отримуємо свічки
     candles = await get_candles(session, symbol)
     if not candles:
         return
 
-    # 2. Перевіряємо піковий об'єм
     is_peak, volume, avg_vol = detect_volume_peak(candles)
+    ratio = volume / avg_vol if avg_vol > 0 else 0
+
     if not is_peak:
-        print(f"  {symbol}: об'єм звичайний ({volume/avg_vol:.1f}× середнього)")
+        print(f"  {symbol}: звичайний об'єм ({ratio:.1f}x)")
         return
 
-    print(f"  {symbol}: ⚡ ПІКОВИЙ ОБ'ЄМ ({volume/avg_vol:.1f}× середнього)")
+    print(f"  {symbol}: ПІКОВИЙ ОБ'ЄМ ({ratio:.1f}x середнього)")
 
-    # 3. Отримуємо ліквідації
     current_price = candles[-1]["close"]
     liq_data      = await get_liquidations(session, symbol)
     clusters      = find_nearby_liquidations(liq_data, current_price)
 
     if not clusters:
-        print(f"  {symbol}: пік є, але кластерів ліквідацій поруч немає")
+        print(f"  {symbol}: пік є, кластерів ліквідацій поруч немає")
         return
 
-    # 4. Беремо найбільший кластер
     top = clusters[0]
-    print(f"  {symbol}: знайдено кластер ${top['usd']/1e6:.1f}M ({top['side']}) на ${top['price']:,.2f}")
+    print(f"  {symbol}: кластер ${top['usd']/1e6:.1f}M ({top['side']}) на ${top['price']:,.2f}")
 
-    # 5. Перевіряємо дублювання
     if is_duplicate(symbol, current_price, top["side"]):
         print(f"  {symbol}: сигнал вже надсилався, пропускаємо")
         return
 
-    # 6. Надсилаємо сигнал
     message = build_message(symbol, current_price, volume, avg_vol, top)
     await send_telegram(session, message)
-    print(f"  {symbol}: ✅ Сигнал надіслано!")
+    print(f"  {symbol}: сигнал надіслано!")
 
 # ─── ГОЛОВНИЙ ЦИКЛ ───────────────────────────────────────────
 async def main():
     print("=" * 50)
     print("  Volume + Liquidation Signal Bot")
-    print(f"  Монети: {', '.join(SYMBOLS)}")
+    print(f"  Монети:    {', '.join(SYMBOLS)}")
+    print(f"  Біржа:     Bybit Futures (Linear)")
     print(f"  Таймфрейм: 1H")
-    print(f"  Перевірка кожні: {CHECK_INTERVAL // 60} хв")
-    print(f"  Мін. множник об'єму: {VOLUME_MULTIPLIER}x")
-    print(f"  Мін. кластер ліквідацій: ${LIQ_THRESHOLD_USD/1e6:.0f}M")
+    print(f"  Перевірка: кожні {CHECK_INTERVAL // 60} хв")
+    print(f"  Множник:   {VOLUME_MULTIPLIER}x")
+    print(f"  Мін. ліквідації: ${LIQ_THRESHOLD_USD/1e6:.0f}M")
     print("=" * 50)
 
     async with aiohttp.ClientSession() as session:
-        # Надсилаємо повідомлення про старт
         await send_telegram(session,
             "🤖 <b>Бот запущено!</b>\n"
-            f"Моніторинг: {', '.join(SYMBOLS)}\n"
+            f"Біржа: Bybit Futures\n"
+            f"Монети: {', '.join(SYMBOLS)}\n"
             f"Таймфрейм: 1H\n"
             f"Перевірка кожні {CHECK_INTERVAL // 60} хв"
         )
 
         while True:
-            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Початок перевірки...")
-
-            # Перевіряємо всі монети паралельно
-            tasks = [check_symbol(session, symbol) for symbol in SYMBOLS]
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] Початок перевірки...")
+            tasks = [check_symbol(session, s) for s in SYMBOLS]
             await asyncio.gather(*tasks, return_exceptions=True)
-
-            print(f"Наступна перевірка через {CHECK_INTERVAL // 60} хв...\n")
+            print(f"Наступна перевірка через {CHECK_INTERVAL // 60} хв...")
             await asyncio.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
