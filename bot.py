@@ -28,29 +28,30 @@ PRICE_PROXIMITY_PCT = 0.5        # скільки % від ціни вважає
 CHECK_INTERVAL = 300
 
 # ─── URL ────────────────────────────────────────────────────
-BINANCE_URL   = "https://fapi.binance.com/fapi/v1/klines"  # ф'ючерси (USDT-M Perpetual)
+BYBIT_URL = "https://api.bybit.com/v5/market/kline"
 COINGLASS_URL = "https://open-api.coinglass.com/public/v2/liquidation_history"
 TELEGRAM_URL  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 # ─── ОТРИМАННЯ СВІЧОК З BINANCE (1H) ────────────────────────
 async def get_candles(session, symbol):
     params = {
+        "category": "linear",
         "symbol":   f"{symbol}USDT",
-        "interval": "1h",           # таймфрейм 1 година
-        "limit":    LOOKBACK_CANDLES + 1
+        "interval": "60",        # 60 хвилин = 1H на Bybit
+        "limit":    str(LOOKBACK_CANDLES + 1)
     }
     try:
-        async with session.get(BINANCE_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        async with session.get(BYBIT_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
             data = await r.json()
-            if not isinstance(data, list):
-                print(f"[BINANCE ERROR] {symbol}: {data}")
-                return []
+            candles = data.get("result", {}).get("list", [])
+            # Bybit повертає від новіших до старіших — перевертаємо
+            candles = list(reversed(candles))
             return [{
                 "close":  float(c[4]),
                 "volume": float(c[5])
-            } for c in data]
+            } for c in candles]
     except Exception as e:
-        print(f"[BINANCE ERROR] {symbol}: {e}")
+        print(f"[BYBIT ERROR] {symbol}: {e}")
         return []
 
 # ─── ОТРИМАННЯ ЛІКВІДАЦІЙ З COINGLASS ───────────────────────
